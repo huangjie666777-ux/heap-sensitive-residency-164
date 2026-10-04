@@ -1,6 +1,10 @@
 package heapx.service;
 
 import heapx.graph.DominatorAnalysis;
+import heapx.mask.HprofArrays;
+import heapx.mask.MaskExporter;
+import heapx.mask.ScanResult;
+import heapx.mask.SensitiveScanner;
 import heapx.model.HeapModel;
 import heapx.parse.AnalysisException;
 import heapx.parse.HprofParser;
@@ -9,6 +13,7 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -16,7 +21,8 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Parses uploads, runs dominator analysis and hands out independent
  * analysis ids. Failed or over-limit uploads publish nothing. Concurrent
- * uploads/queries are isolated; delete frees all resources. No persistence.
+ * uploads/queries/scans are isolated; delete frees the source dump, all
+ * scans and every other resource. No persistence.
  */
 public final class AnalysisService {
     public static final long MAX_BYTES = 100L * 1024 * 1024;
@@ -28,17 +34,20 @@ public final class AnalysisService {
     private static final class TooLargeException extends RuntimeException {}
 
     private final Map<String, Analysis> analyses = new ConcurrentHashMap<>();
+    private final Map<String, ScanResult> scans = new ConcurrentHashMap<>();
     private final HprofParser parser = new HprofParser(MAX_OBJECTS, MAX_EDGES);
 
     public Analysis analyze(InputStream in) throws AnalysisException {
         Path tmp = null;
+        boolean published = false;
         try {
             tmp = Files.createTempFile("heapx-upload-", ".hprof");
             copyBounded(in, tmp);
             HeapModel model = parser.parse(tmp.toFile());
             DominatorAnalysis da = DominatorAnalysis.compute(model);
-            Analysis a = new Analysis(UUID.randomUUID().toString(), model, da);
+            Analysis a = new Analysis(UUID.randomUUID().toString(), model, da, tmp);
             analyses.put(a.id, a);
+            published = true;
             return a;
         } catch (TooLargeException e) {
             throw new AnalysisException(422,
@@ -46,7 +55,7 @@ public final class AnalysisService {
         } catch (IOException e) {
             throw new AnalysisException(400, "failed to store upload: " + e.getMessage());
         } finally {
-            if (tmp != null) {
+            if (!published && tmp != null) {
                 try { Files.deleteIfExists(tmp); } catch (IOException ignored) {}
             }
         }
@@ -65,9 +74,54 @@ public final class AnalysisService {
         }
     }
 
+    /** Runs a sensitive-value scan over the retained source dump. The scan
+     *  is built fully before publication; failures publish nothing. */
+    public ScanResult createScan(String analysisId, List<SensitiveScanner.RuleInput> inputs)
+            throws AnalysisException {
+        Analysis a = analyses.get(analysisId);
+        if (a == null) return null;
+        List<SensitiveScanner.Rule> rules = SensitiveScanner.validate(inputs);
+        byte[] file = readSource(a);
+        List<HprofArrays.ArrayPayload> arrays = HprofArrays.locate(file);
+        ScanResult scan = SensitiveScanner.scan(UUID.randomUUID().toString(), analysisId,
+                file, arrays, rules, a.model, a.dominators);
+        scans.put(scan.scanId, scan);
+        return scan;
+    }
+
+    public ScanResult getScan(String analysisId, String scanId) {
+        ScanResult s = scans.get(scanId);
+        return s != null && s.analysisId.equals(analysisId) ? s : null;
+    }
+
+    /** Builds the masked HPROF copy for a completed scan, in memory;
+     *  the original dump is never modified. */
+    public MaskExporter.Masked exportMasked(String analysisId, String scanId)
+            throws AnalysisException {
+        Analysis a = analyses.get(analysisId);
+        if (a == null) return null;
+        ScanResult scan = getScan(analysisId, scanId);
+        if (scan == null) return null;
+        return MaskExporter.apply(readSource(a), scan);
+    }
+
+    private static byte[] readSource(Analysis a) throws AnalysisException {
+        try {
+            return Files.readAllBytes(a.source);
+        } catch (IOException e) {
+            throw new AnalysisException(500, "failed to read retained dump: " + e.getMessage());
+        }
+    }
+
     public Analysis get(String id) { return analyses.get(id); }
 
-    public boolean delete(String id) { return analyses.remove(id) != null; }
+    public boolean delete(String id) {
+        Analysis a = analyses.remove(id);
+        if (a == null) return false;
+        scans.values().removeIf(s -> s.analysisId.equals(id));
+        try { Files.deleteIfExists(a.source); } catch (IOException ignored) {}
+        return true;
+    }
 
     public int count() { return analyses.size(); }
 }

@@ -2,6 +2,9 @@ package heapx.http;
 
 import heapx.graph.PathFinder;
 import heapx.graph.CutPlanner;
+import heapx.mask.MaskExporter;
+import heapx.mask.ScanResult;
+import heapx.mask.SensitiveScanner;
 import heapx.model.HeapModel;
 import heapx.parse.AnalysisException;
 import heapx.service.Analysis;
@@ -11,6 +14,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.HttpStatus;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import java.io.InputStream;
 import java.util.ArrayList;
@@ -23,6 +28,7 @@ import java.util.Set;
 /** Javalin routes for upload, retained ranking, root paths, cut plans and delete. */
 public final class Api {
     private static final ObjectMapper JSON = new ObjectMapper();
+    private static final Logger LOG = LoggerFactory.getLogger(Api.class);
     static final int MAX_TARGETS = 32;
     static final int MAX_CANDIDATES = 1000;
     static final long MAX_COST = 1_000_000_000L;
@@ -220,8 +226,123 @@ public final class Api {
             ctx.json(resp);
         });
 
+
+        app.post("/api/analyses/{id}/scans", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            JsonNode body;
+            try {
+                body = JSON.readTree(ctx.body());
+            } catch (Exception e) {
+                badRequest(ctx, "invalid JSON body");
+                return;
+            }
+            if (body == null || !body.isObject() || body.get("rules") == null
+                    || !body.get("rules").isArray()) {
+                badRequest(ctx, "JSON object with a 'rules' array of {id, text} expected");
+                return;
+            }
+            List<SensitiveScanner.RuleInput> inputs = new ArrayList<>();
+            for (JsonNode r : body.get("rules")) {
+                JsonNode id = r == null ? null : r.get("id");
+                JsonNode text = r == null ? null : r.get("text");
+                inputs.add(new SensitiveScanner.RuleInput(
+                        id != null && id.isTextual() ? id.asText() : null,
+                        text != null && text.isTextual() ? text.asText() : null));
+            }
+            try {
+                ScanResult scan = service.createScan(a.id, inputs);
+                LOG.info("scan {} created for analysis {}: {} rules, {} hits",
+                        scan.scanId, a.id, scan.ruleCount, scan.hitCount());
+                ctx.status(HttpStatus.CREATED).json(scanJson(scan));
+            } catch (AnalysisException e) {
+                ctx.status(e.status).json(Map.of("error", e.getMessage()));
+            }
+        });
+
+        app.get("/api/analyses/{id}/scans/{scanId}", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            ScanResult scan = requireScan(ctx, service, a);
+            if (scan != null) ctx.json(scanJson(scan));
+        });
+
+        app.get("/api/analyses/{id}/scans/{scanId}/export", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            ScanResult scan = requireScan(ctx, service, a);
+            if (scan == null) return;
+            MaskExporter.Masked masked;
+            try {
+                masked = service.exportMasked(a.id, scan.scanId);
+            } catch (AnalysisException e) {
+                ctx.status(e.status).json(Map.of("error", e.getMessage()));
+                return;
+            }
+            LOG.info("scan {} exported for analysis {}: {} arrays masked, {} bytes zeroed",
+                    scan.scanId, a.id, masked.arraysModified(), masked.bytesMasked());
+            ctx.header("X-Masked-Arrays", String.valueOf(masked.arraysModified()));
+            ctx.header("X-Masked-Bytes", String.valueOf(masked.bytesMasked()));
+            ctx.header("Content-Disposition",
+                    "attachment; filename=\"masked-" + scan.scanId + ".hprof\"");
+            ctx.contentType("application/octet-stream");
+            ctx.result(masked.data());
+        });
+
         app.start(port);
         return app;
+    }
+
+
+    private static ScanResult requireScan(Context ctx, AnalysisService service, Analysis a) {
+        ScanResult scan = service.getScan(a.id, ctx.pathParam("scanId"));
+        if (scan == null) {
+            ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", "unknown scan id"));
+        }
+        return scan;
+    }
+
+    private static Map<String, Object> scanJson(ScanResult scan) {
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("analysisId", scan.analysisId);
+        resp.put("scanId", scan.scanId);
+        resp.put("ruleCount", scan.ruleCount);
+        resp.put("hitCount", scan.hitCount());
+        List<Map<String, Object>> hits = new ArrayList<>();
+        for (ScanResult.Hit h : scan.hits) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("ruleId", h.ruleId());
+            m.put("arrayId", hex(h.arrayId()));
+            m.put("arrayType", h.arrayType());
+            m.put("elementStart", h.elementStart());
+            m.put("length", h.length());
+            m.put("reachable", h.reachable());
+            if (h.reachable() && h.path() != null) {
+                Map<String, Object> path = new LinkedHashMap<>();
+                path.put("rootObjectId", h.path().isEmpty()
+                        ? hex(h.arrayId()) : hex(h.path().get(0).fromId()));
+                path.put("pathLength", h.path().size());
+                path.put("edges", edgesJson(h.path()));
+                m.put("path", path);
+            }
+            hits.add(m);
+        }
+        resp.put("hits", hits);
+        return resp;
+    }
+
+    private static List<Map<String, Object>> edgesJson(List<PathFinder.Step> steps) {
+        List<Map<String, Object>> edges = new ArrayList<>();
+        for (PathFinder.Step s : steps) {
+            Map<String, Object> e = new LinkedHashMap<>();
+            e.put("from", hex(s.fromId()));
+            e.put("fromClass", s.fromClass());
+            e.put("via", s.via());
+            e.put("to", hex(s.toId()));
+            e.put("toClass", s.toClass());
+            edges.add(e);
+        }
+        return edges;
     }
 
     private static int[] parseTargets(Context ctx, Analysis a, JsonNode node) {
