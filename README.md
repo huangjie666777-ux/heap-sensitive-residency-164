@@ -49,7 +49,51 @@ java -jar target/heapx-1.0.0-jar-with-dependencies.jar
 | GET | `/api/analyses/{id}/objects/{hexId}` | 单个对象：类、浅堆、保留量、立即支配者 |
 | GET | `/api/analyses/{id}/objects/{hexId}/path` | 到任一根的最短强引用路径（逐边字段/下标） |
 | POST | `/api/analyses/{id}/cut-plan` | 最低代价断引用规划：使目标对象全部不可达的最小代价引用集合 |
+| POST | `/api/analyses/{id}/scans` | 提交 1–16 条敏感值规则，扫描 byte[]/char[] 载荷，返回不可变 `scanId` |
+| GET | `/api/analyses/{id}/scans/{scanId}` | 重新获取扫描结果（不可变） |
+| GET | `/api/analyses/{id}/scans/{scanId}/export` | 下载按扫描命中遮除（置零）的真实 HPROF 副本 |
 | DELETE | `/api/analyses/{id}` | 删除分析并释放资源 |
+
+## 敏感值扫描与遮除导出
+
+提交规则（JSON，原文不会出现在任何响应、错误消息或日志中）：
+
+```json
+{"rules": [{"id": "token", "value": "tok_live_9f8e7d6c5b"},
+           {"id": "pw", "value": "correct horse battery"}]}
+```
+
+- **规则**：1–16 条；`id` 为 1–64 个可打印 ASCII 字符且本次请求内唯一；
+  `value` 为 4–128 个可打印 ASCII 字符（0x20–0x7E）。重复 id、过短/过长、
+  非可打印字符一律 400 拒绝，错误消息只含规则 id，不回显原文。
+- **扫描口径**：只扫描 `byte[]` 与 `char[]` 的载荷，按 ASCII 字节（byte[]）
+  或等值字符（char[]，大端 UTF-16 单元高位为 0）精确匹配；枚举全部位置，
+  含重叠命中、多规则命中同一数组、不可达数组。不跨数组匹配，不识别
+  UTF-8/UTF-16 等其他编码。载荷位置由自研的 HPROF 记录遍历器定位
+  （兼容 4/8 字节 ID 与 HEAP_DUMP_SEGMENT 分段堆），不做全文件字符串搜索。
+- **结果**：绑定不可变 `scanId`，每条命中含 `ruleId`、`arrayId`（对象十六进制
+  ID）、`arrayType`、`elementOffset`/`elementLength`（以数组元素计）、
+  `reachable`；可达命中附持有数组的最短强引用根路径 `rootPath`。
+
+导出（`GET .../scans/{scanId}/export`）返回真实 HPROF 副本
+（`application/octet-stream` 附件），响应头：
+
+- `X-Scrubbed-Arrays`：实际修改的去重数组个数（共享数组只改一次，
+  多个持有者读到同一份遮除值）；
+- `X-Scrubbed-Bytes`：实际改写的字节数（命中区间按数组求并集，
+  重叠/相邻区间不重复计数）。
+
+遮除语义与边界：
+
+- 只把命中区间在副本中置零；未命中载荷、对象 ID、GC 根、引用、类型、
+  数组长度及所有其他记录字节逐一保留。副本可重新上传分析，原排名、
+  根路径与断引用规划结果不变。
+- 不改动 HPROF STRING 记录（类名、字段名等文本）与任何非 byte[]/char[]
+  内容——**这不是完全匿名化**，敏感值若同时存在于字符串记录等其他
+  结构中不会被移除。
+- 原转储在分析存续期间保留用于扫描与导出；导出失败不会发布半份文件；
+  `DELETE` 删除源转储、扫描结果与导出临时文件，之后扫描/导出一律 404。
+  并发扫描/导出/查询互不影响，沿用原有的文件/对象/边规模限制。
 
 ## 断引用规划（cut-plan）
 
@@ -144,6 +188,25 @@ curl -s -X POST "http://localhost:7717/api/analyses/<analysisId>/cut-plan" \
 # => {"feasible":true,"totalCost":15,"cuts":[...elementData...],
 #     "newlyUnreachable":{"count":21,"shallowBytes":1311400,...}}
 
+# 敏感值扫描：提交规则（原文不回显）
+curl -s -X POST "http://localhost:7717/api/analyses/<analysisId>/scans" \
+  -H 'Content-Type: application/json' \
+  -d '{"rules":[{"id":"token","value":"tok_live_9f8e7d6c5b"}]}'
+# => {"scanId":"ebe9ebf5-...","hitCount":3,"hits":[{"ruleId":"token",
+#      "arrayId":"0x709a17710","arrayType":"byte[]","elementOffset":0,
+#      "elementLength":19,"reachable":true,"rootPath":[...]},...]}
+
+# 下载遮除副本（命中区间已置零）
+curl -s -D - -o scrubbed.hprof \
+  "http://localhost:7717/api/analyses/<analysisId>/scans/<scanId>/export"
+# => HTTP/1.1 200 OK
+#    X-Scrubbed-Arrays: 3
+#    X-Scrubbed-Bytes: 76
+
+# 副本可重新上传分析：对象/边/排名不变，敏感值已消失
+curl -s http://localhost:7717/api/analyses -F "file=@scrubbed.hprof"
+# => {"analysisId":"...","objects":21972,"edges":32644,"unreachableObjects":38}
+
 # 释放
 curl -s -X DELETE "http://localhost:7717/api/analyses/<analysisId>"
 ```
@@ -156,7 +219,14 @@ curl -s -X DELETE "http://localhost:7717/api/analyses/<analysisId>"
 - `heapx.graph.PathFinder` — 反向 BFS 求到根的最短强引用路径
 - `heapx.graph.CutPlanner` — 超源/超汇最小 s-t 割（Dinic）求最低代价断引用方案，
   含不可断证据路径与可达集合差计算
-- `heapx.service.AnalysisService` — 分析注册表、限制、并发隔离、删除
+- `heapx.scrub.HprofLayout` — HPROF 记录/子记录遍历，定位 byte[]/char[]
+  载荷文件偏移（4/8 字节 ID、分段堆）
+- `heapx.scrub.PayloadScanner` — 载荷内精确 ASCII 匹配（重叠、多规则、
+  byte[]/char[]），不跨数组
+- `heapx.scrub.ScrubExporter` — 复制原文件后仅对命中区间并集置零，
+  统计去重数组数与实际改写字节数
+- `heapx.service.AnalysisService` — 分析注册表、源转储保留、扫描/导出
+  生命周期、限制、并发隔离、删除清理
 - `heapx.http.Api` / `heapx.Main` — Javalin 路由与启动
 
 ## 测试
@@ -175,3 +245,7 @@ mvn -B test
   不可达对象，并走完整 HTTP 上传 → 排行 → 根路径 → 断引用规划 → 删除流程；
   另验证对象/边超限、损坏文件与非法规划请求（重复候选、非法代价、
   不存在的引用）的拒绝。
+- `ScrubTest`：敏感值扫描与遮除导出。覆盖重叠命中、多规则、char[] 与
+  不可达数组、根路径附件、非法规则拒绝且不回显原文、命中区间并集置零
+  （逐字节校验其余内容不变）、去重数组数与改写字节数、8 字节 ID 与
+  分段堆、副本重新上传后排名不变且复扫零命中、删除后扫描/导出 404。

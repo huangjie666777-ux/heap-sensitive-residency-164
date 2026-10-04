@@ -4,6 +4,9 @@ import heapx.graph.PathFinder;
 import heapx.graph.CutPlanner;
 import heapx.model.HeapModel;
 import heapx.parse.AnalysisException;
+import heapx.scrub.ScanHit;
+import heapx.scrub.ScanRecord;
+import heapx.scrub.ScrubRule;
 import heapx.service.Analysis;
 import heapx.service.AnalysisService;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -12,7 +15,9 @@ import io.javalin.Javalin;
 import io.javalin.http.Context;
 import io.javalin.http.HttpStatus;
 
+import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -20,7 +25,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** Javalin routes for upload, retained ranking, root paths, cut plans and delete. */
+/** Javalin routes for upload, retained ranking, root paths, cut plans,
+ *  sensitive-value scans, scrubbed exports and delete. */
 public final class Api {
     private static final ObjectMapper JSON = new ObjectMapper();
     static final int MAX_TARGETS = 32;
@@ -129,6 +135,82 @@ public final class Api {
                 ctx.json(Map.of("deleted", ctx.pathParam("id")));
             } else {
                 ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", "unknown analysis id"));
+            }
+        });
+
+        app.post("/api/analyses/{id}/scans", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            JsonNode body;
+            try {
+                body = JSON.readTree(ctx.body());
+            } catch (Exception e) {
+                badRequest(ctx, "invalid JSON body");
+                return;
+            }
+            if (body == null || !body.isObject() || !body.has("rules")
+                    || !body.get("rules").isArray()) {
+                badRequest(ctx, "JSON object with a 'rules' array expected");
+                return;
+            }
+            List<ScrubRule.RawRule> raw = new ArrayList<>();
+            for (JsonNode r : body.get("rules")) {
+                JsonNode id = r == null ? null : r.get("id");
+                JsonNode value = r == null ? null : r.get("value");
+                raw.add(new ScrubRule.RawRule(
+                        id != null && id.isTextual() ? id.asText() : null,
+                        value != null && value.isTextual() ? value.asText() : null));
+            }
+            List<ScrubRule> rules;
+            try {
+                rules = ScrubRule.validateAll(raw);
+            } catch (AnalysisException e) {
+                ctx.status(e.status).json(Map.of("error", e.getMessage()));
+                return;
+            }
+            ScanRecord record;
+            try {
+                record = service.scan(a, rules);
+            } catch (AnalysisException e) {
+                ctx.status(e.status).json(Map.of("error", e.getMessage()));
+                return;
+            }
+            ctx.status(HttpStatus.CREATED).json(scanJson(a, record));
+        });
+
+        app.get("/api/analyses/{id}/scans/{scanId}", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            ScanRecord record = requireScan(ctx, service, a);
+            if (record != null) ctx.json(scanJson(a, record));
+        });
+
+        app.get("/api/analyses/{id}/scans/{scanId}/export", ctx -> {
+            Analysis a = require(ctx, service);
+            if (a == null) return;
+            ScanRecord record = requireScan(ctx, service, a);
+            if (record == null) return;
+            AnalysisService.Export export;
+            try {
+                export = service.export(a, record);
+            } catch (AnalysisException e) {
+                ctx.status(e.status).json(Map.of("error", e.getMessage()));
+                return;
+            }
+            try {
+                ctx.header("Content-Type", "application/octet-stream");
+                ctx.header("Content-Disposition",
+                        "attachment; filename=\"scrubbed-" + record.scanId() + ".hprof\"");
+                ctx.header("X-Scrubbed-Arrays", String.valueOf(export.stats().modifiedArrays()));
+                ctx.header("X-Scrubbed-Bytes", String.valueOf(export.stats().scrubbedBytes()));
+                ctx.header("Content-Length", String.valueOf(Files.size(export.file())));
+                try (InputStream in = Files.newInputStream(export.file())) {
+                    in.transferTo(ctx.outputStream());
+                }
+            } catch (IOException e) {
+                throw new RuntimeException("failed to stream scrubbed copy", e);
+            } finally {
+                service.cleanup(export);
             }
         });
 
@@ -376,6 +458,49 @@ public final class Api {
             ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", "unknown analysis id"));
         }
         return a;
+    }
+
+    private static ScanRecord requireScan(Context ctx, AnalysisService service, Analysis a) {
+        ScanRecord record = service.scanOf(a, ctx.pathParam("scanId"));
+        if (record == null) {
+            ctx.status(HttpStatus.NOT_FOUND).json(Map.of("error", "unknown scan id"));
+        }
+        return record;
+    }
+
+    /** Scan result JSON; rule literals are never echoed, only rule ids. */
+    private static Map<String, Object> scanJson(Analysis a, ScanRecord record) {
+        List<Map<String, Object>> hits = new ArrayList<>();
+        for (ScanHit h : record.hits()) {
+            Map<String, Object> m = new LinkedHashMap<>();
+            m.put("ruleId", h.ruleId());
+            m.put("arrayId", hex(h.arrayObjectId()));
+            m.put("arrayType", h.charArray() ? "char[]" : "byte[]");
+            m.put("elementOffset", h.elementOffset());
+            m.put("elementLength", h.elementLength());
+            m.put("reachable", h.reachable());
+            if (h.reachable() && h.path() != null) {
+                List<Map<String, Object>> edges = new ArrayList<>();
+                for (PathFinder.Step s : h.path()) {
+                    Map<String, Object> e = new LinkedHashMap<>();
+                    e.put("from", hex(s.fromId()));
+                    e.put("fromClass", s.fromClass());
+                    e.put("via", s.via());
+                    e.put("to", hex(s.toId()));
+                    e.put("toClass", s.toClass());
+                    edges.add(e);
+                }
+                m.put("rootPath", edges);
+            }
+            hits.add(m);
+        }
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("analysisId", a.id);
+        resp.put("scanId", record.scanId());
+        resp.put("rules", record.ruleCount());
+        resp.put("hitCount", hits.size());
+        resp.put("hits", hits);
+        return resp;
     }
 
     private static Integer objectIndex(Context ctx, Analysis a) {

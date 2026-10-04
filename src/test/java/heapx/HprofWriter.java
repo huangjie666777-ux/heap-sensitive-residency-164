@@ -14,11 +14,20 @@ import java.util.Map;
 
 /**
  * Minimal HPROF (JAVA PROFILE 1.0.2) writer used to produce real dump files
- * for tests and demos. Uses 4-byte identifiers.
+ * for tests and demos. Supports 4- and 8-byte identifiers and segmented heaps.
  */
 final class HprofWriter {
     static final int T_OBJECT = 2, T_BOOLEAN = 4, T_CHAR = 5, T_FLOAT = 6,
             T_DOUBLE = 7, T_BYTE = 8, T_SHORT = 9, T_INT = 10, T_LONG = 11;
+
+    final int idSize;
+
+    HprofWriter() { this(4); }
+
+    HprofWriter(int idSize) {
+        if (idSize != 4 && idSize != 8) throw new IllegalArgumentException();
+        this.idSize = idSize;
+    }
 
     private final Map<String, Integer> stringIds = new HashMap<>();
     private final ByteArrayOutputStream strings = new ByteArrayOutputStream();
@@ -35,7 +44,7 @@ final class HprofWriter {
             try {
                 ByteArrayOutputStream b = new ByteArrayOutputStream();
                 DataOutputStream d = new DataOutputStream(b);
-                d.writeInt(id);
+                writeId(d, id);
                 d.write(s.getBytes(StandardCharsets.UTF_8));
                 d.flush();
                 strings.write(record(0x01, b.toByteArray()));
@@ -74,8 +83,8 @@ final class HprofWriter {
     void jniGlobalRoot(int objId) {
         try {
             h.writeByte(0x01); // ROOT JNI GLOBAL
-            h.writeInt(objId);
-            h.writeInt(objId); // jni global ref id
+            writeId(h, objId);
+            writeId(h, objId); // jni global ref id
         } catch (IOException e) { throw new RuntimeException(e); }
     }
 
@@ -84,9 +93,9 @@ final class HprofWriter {
         try {
             ByteArrayOutputStream b = new ByteArrayOutputStream();
             DataOutputStream d = new DataOutputStream(b);
-            d.writeInt(objId);
+            writeId(d, objId);
             d.writeInt(0); // stack trace serial
-            d.writeInt(classId);
+            writeId(d, classId);
             ByteArrayOutputStream fb = new ByteArrayOutputStream();
             DataOutputStream f = new DataOutputStream(fb);
             // write instance fields of superclasses first (jhat/NetBeans expect declaration order)
@@ -114,28 +123,44 @@ final class HprofWriter {
     void objectArray(int objId, int arrayClassId, int... elements) {
         try {
             h.writeByte(0x22); // OBJECT_ARRAY_DUMP
-            h.writeInt(objId);
+            writeId(h, objId);
             h.writeInt(0);
             h.writeInt(elements.length);
-            h.writeInt(arrayClassId);
-            for (int e : elements) h.writeInt(e);
+            writeId(h, arrayClassId);
+            for (int e : elements) writeId(h, e);
         } catch (IOException e) { throw new RuntimeException(e); }
     }
 
     void byteArray(int objId, byte[] data) {
+        primitiveArray(objId, T_BYTE, data.length, d -> d.write(data));
+    }
+
+    void charArray(int objId, char[] data) {
+        primitiveArray(objId, T_CHAR, data.length, d -> {
+            for (char c : data) d.writeChar(c);
+        });
+    }
+
+    private interface ArrayBody { void write(DataOutputStream d) throws IOException; }
+
+    private void primitiveArray(int objId, int type, int count, ArrayBody body) {
         try {
             h.writeByte(0x23); // PRIMITIVE_ARRAY_DUMP
-            h.writeInt(objId);
+            writeId(h, objId);
             h.writeInt(0);
-            h.writeInt(data.length);
-            h.writeByte(T_BYTE);
-            h.write(data);
+            h.writeInt(count);
+            h.writeByte(type);
+            body.write(h);
         } catch (IOException e) { throw new RuntimeException(e); }
     }
 
-    private static void writeValue(DataOutputStream d, int type, Object v) throws IOException {
+    private void writeId(DataOutputStream d, long id) throws IOException {
+        if (idSize == 4) d.writeInt((int) id); else d.writeLong(id);
+    }
+
+    private void writeValue(DataOutputStream d, int type, Object v) throws IOException {
         switch (type) {
-            case T_OBJECT -> d.writeInt(((Number) v).intValue());
+            case T_OBJECT -> writeId(d, ((Number) v).longValue());
             case T_INT -> d.writeInt(((Number) v).intValue());
             case T_LONG -> d.writeLong(((Number) v).longValue());
             case T_BYTE, T_BOOLEAN -> d.writeByte(((Number) v).intValue());
@@ -147,9 +172,9 @@ final class HprofWriter {
         }
     }
 
-    private static int typeSize(int type) {
+    private int typeSize(int type) {
         return switch (type) {
-            case T_OBJECT -> 4; case T_BOOLEAN, T_BYTE -> 1;
+            case T_OBJECT -> idSize; case T_BOOLEAN, T_BYTE -> 1;
             case T_CHAR, T_SHORT -> 2; case T_INT, T_FLOAT -> 4;
             case T_LONG, T_DOUBLE -> 8;
             default -> throw new IllegalArgumentException();
@@ -157,11 +182,17 @@ final class HprofWriter {
     }
 
     Path write(Path file) throws IOException {
+        return write(file, false);
+    }
+
+    /** @param segmented emit the heap as two HEAP_DUMP_SEGMENT records plus
+     *                    a HEAP_DUMP_END record instead of one HEAP_DUMP */
+    Path write(Path file, boolean segmented) throws IOException {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         DataOutputStream d = new DataOutputStream(out);
         d.write("JAVA PROFILE 1.0.2".getBytes(StandardCharsets.US_ASCII));
         d.writeByte(0);
-        d.writeInt(4);            // identifier size: 4 bytes
+        d.writeInt(idSize);       // identifier size
         d.writeLong(System.currentTimeMillis());
         // intern every string up-front so STRING records precede their use
         for (ClassDef c : classes.values()) {
@@ -175,9 +206,9 @@ final class HprofWriter {
             ByteArrayOutputStream b = new ByteArrayOutputStream();
             DataOutputStream x = new DataOutputStream(b);
             x.writeInt(nextClassSerial++);
-            x.writeInt(c.classId);
+            writeId(x, c.classId);
             x.writeInt(0);
-            x.writeInt(string(c.name));
+            writeId(x, string(c.name));
             x.flush();
             out.write(record(0x02, b.toByteArray()));
         }
@@ -185,24 +216,24 @@ final class HprofWriter {
         for (ClassDef c : classes.values()) {
             ByteArrayOutputStream b = new ByteArrayOutputStream();
             DataOutputStream x = new DataOutputStream(b);
-            x.writeInt(c.classId);
+            writeId(x, c.classId);
             x.writeInt(0); // stack serial
-            x.writeInt(c.superClassId);
-            x.writeInt(0); x.writeInt(0); x.writeInt(0); // loader, signers, pd
-            x.writeInt(0); x.writeInt(0); // reserved
+            writeId(x, c.superClassId);
+            writeId(x, 0); writeId(x, 0); writeId(x, 0); // loader, signers, pd
+            writeId(x, 0); writeId(x, 0); // reserved
             int size = 0;
             for (FieldDef f : allInstanceFields(c)) size += typeSize(f.type);
             x.writeInt(size);
             x.writeShort(0); // constant pool
             x.writeShort(c.staticFields.size());
             for (FieldDef f : c.staticFields) {
-                x.writeInt(string(f.name));
+                writeId(x, string(f.name));
                 x.writeByte(f.type);
                 writeValue(x, f.type, f.value);
             }
             x.writeShort(c.instanceFields.size());
             for (FieldDef f : c.instanceFields) {
-                x.writeInt(string(f.name));
+                writeId(x, string(f.name));
                 x.writeByte(f.type);
             }
             x.flush();
@@ -213,7 +244,13 @@ final class HprofWriter {
         ByteArrayOutputStream heapAll = new ByteArrayOutputStream();
         heapAll.write(heapClasses.toByteArray());
         heapAll.write(heapData.toByteArray());
-        out.write(record(0x0C, heapAll.toByteArray())); // HEAP_DUMP
+        if (segmented) {
+            out.write(record(0x1C, heapClasses.toByteArray())); // HEAP_DUMP_SEGMENT
+            out.write(record(0x1C, heapData.toByteArray()));    // HEAP_DUMP_SEGMENT
+            out.write(record(0x2C, new byte[0]));               // HEAP_DUMP_END
+        } else {
+            out.write(record(0x0C, heapAll.toByteArray()));     // HEAP_DUMP
+        }
         d.flush();
         Files.write(file, out.toByteArray());
         return file;
